@@ -1,5 +1,5 @@
 import streamlit as st
-import sqlite3, json, io, os, datetime, uuid
+import sqlite3, json, io, os, datetime, uuid, re
 from pathlib import Path
 from PIL import Image as PILImage, ImageOps
 import pandas as pd
@@ -67,12 +67,13 @@ def make_pdf(r):
     normal=ParagraphStyle('thai',fontName='Thai',fontSize=10,leading=16,wordWrap='CJK')
     small=ParagraphStyle('small',parent=normal,fontSize=8,leading=12)
     title=ParagraphStyle('title',parent=normal,fontSize=16,leading=22,alignment=1)
-    # ฟอนต์ภาษาไทยบางไฟล์ไม่แสดงตัวเลขอารบิกใน PDF
-    # แปลงเฉพาะตัวเลขที่พิมพ์ในรายงานเป็นเลขไทย เพื่อให้บ้านเลขที่/วันที่ไม่หาย
-    thai_digits = str.maketrans('0123456789', '๐๑๒๓๔๕๖๗๘๙')
+    # ใช้ฟอนต์ Helvetica เฉพาะตัวเลขอารบิก เพื่อให้แสดง 0-9 ถูกต้องใน PDF
+    # ส่วนอักษรไทยยังใช้ NotoSansThai ตามเดิม
     def p(s, style=normal):
         value = str(s if s is not None and str(s).strip() else '-')
-        return Paragraph(escape(value.translate(thai_digits)).replace('\n', '<br/>'), style)
+        safe = escape(value)
+        safe = re.sub(r'[0-9]+', lambda m: '<font name="Helvetica">' + m.group(0) + '</font>', safe)
+        return Paragraph(safe.replace('\n', '<br/>'), style)
     def survey_date_text(record):
         raw = str(record.get('survey_date') or '').strip()
         if not raw or raw in ('--', '-'):
@@ -123,7 +124,7 @@ def make_pdf(r):
     signatures=Table([[signature(r.get('rep_sign'),r.get('rep_name'),'ตัวแทนโครงการ'),signature(r.get('owner_sign'),r.get('owner_sign_name'),'เจ้าของบ้าน')]],colWidths=[13.6*cm,13.6*cm])
     story.append(KeepTogether(signatures))
     def footer(canvas,doc):
-        canvas.setFont('Thai',8);canvas.drawRightString(28.5*cm,.6*cm,f'หน้า {doc.page}')
+        canvas.setFont('Thai',8);canvas.drawRightString(28.0*cm,.6*cm,'หน้า');canvas.setFont('Helvetica',8);canvas.drawRightString(28.5*cm,.6*cm,str(doc.page))
     doc.build(story,onFirstPage=footer,onLaterPages=footer)
     return buf.getvalue()
 
