@@ -1,5 +1,5 @@
 streamlit==1.39.0
 reportlab>=4.2,<5
-Pillow>=10.4,<11
+Pillow==10.4.0
 pandas>=2.2,<3
 streamlit-drawable-canvas==0.9.3
