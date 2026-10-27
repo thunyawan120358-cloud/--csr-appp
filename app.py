@@ -194,9 +194,18 @@ elif tab.startswith('📂'):
             st.caption(f"โครงการ: {r['project']} | สำรวจ: {r['survey_date']} | อัปเดต: {r['updated_at']} | เสร็จ {done}/{len(items)}")
             c1,c2=st.columns(2)
             with c1:
-load_form(r)
-st.session_state.current_menu = '📝 แบบฟอร์มสำรวจ'
-st.rerun()
+                if st.button('✏️ เปิดแก้ไข/เพิ่มภาพหลังแก้ไข', key='edit_'+str(r['id'])):
+                    load_form(r)
+                    st.session_state.current_menu = MENU_OPTIONS[0]
+                    st.rerun())
+            with c2:
+                st.download_button(
+                    '⬇️ ดาวน์โหลด PDF ล่าสุด',
+                    data=make_pdf(r),
+                    file_name=f"inspection_{r['id']}.pdf",
+                    mime='application/pdf',
+                    key='pdf_'+str(r['id'])
+                )
     st.info('เมื่อกดเปิดแก้ไข ระบบจะโหลดข้อมูลเข้าหน้าแบบฟอร์ม กรุณาเลือกเมนูแบบฟอร์มสำรวจเพื่อแก้ไขแล้วกดบันทึก')
 else:
     st.subheader('แดชบอร์ดภาพรวม')
