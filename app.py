@@ -18,7 +18,7 @@ DATA=Path(os.environ.get('INSPECTION_DATA_DIR',str(ROOT/'data')))
 DATA.mkdir(parents=True,exist_ok=True)
 (DB,UPLOADS)=(DATA/'inspection.db',DATA/'uploads')
 UPLOADS.mkdir(exist_ok=True)
-FONT=ROOT/'fonts'/'NotoSansThai-Regular.ttf'
+FONT=ROOT/'NotoSansThai-Regular.ttf'
 if not FONT.exists():
     st.error('ไม่พบ fonts/NotoSansThai-Regular.ttf กรุณาอ่าน README.md'); st.stop()
 pdfmetrics.registerFont(TTFont('Thai',str(FONT)))
