@@ -98,7 +98,21 @@ def make_pdf(r):
 
 st.title('🏠 ระบบสำรวจความเสียหายบ้านข้างเคียง')
 st.caption('บันทึกภาพก่อน–หลังแก้ไข • ติดตามสถานะ • รายงาน PDF ภาษาไทย')
-tab=st.radio('เมนูหลัก',['📝 แบบฟอร์มสำรวจ','📂 ประวัติรายการ','📊 แดชบอร์ด'],horizontal=True)
+MENU_OPTIONS = [
+    '📝 แบบฟอร์มสำรวจ',
+    '📂 ประวัติรายการ',
+    '📊 แดชบอร์ด'
+]
+
+if 'current_menu' not in st.session_state:
+    st.session_state.current_menu = MENU_OPTIONS[0]
+
+tab = st.radio(
+    'เมนูหลัก',
+    MENU_OPTIONS,
+    key='current_menu',
+    horizontal=True
+)
 records=all_records()
 statuses=['รอดำเนินการ','กำลังดำเนินการ','แก้ไขแล้ว','ไม่ต้องแก้ไข']
 if tab.startswith('📝'):
@@ -180,10 +194,9 @@ elif tab.startswith('📂'):
             st.caption(f"โครงการ: {r['project']} | สำรวจ: {r['survey_date']} | อัปเดต: {r['updated_at']} | เสร็จ {done}/{len(items)}")
             c1,c2=st.columns(2)
             with c1:
-                if st.button('✏️ เปิดแก้ไข/เพิ่มภาพหลังแก้ไข',key='edit_'+r['id']):
-                    load_form(r);st.rerun()
-            with c2:
-                st.download_button('⬇️ ดาวน์โหลด PDF ล่าสุด',data=make_pdf(r),file_name=f'inspection_{r["house_no"]}_{r["id"][:8]}.pdf',mime='application/pdf',key='pdf_'+r['id'])
+load_form(r)
+st.session_state.current_menu = '📝 แบบฟอร์มสำรวจ'
+st.rerun()
     st.info('เมื่อกดเปิดแก้ไข ระบบจะโหลดข้อมูลเข้าหน้าแบบฟอร์ม กรุณาเลือกเมนูแบบฟอร์มสำรวจเพื่อแก้ไขแล้วกดบันทึก')
 else:
     st.subheader('แดชบอร์ดภาพรวม')
