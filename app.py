@@ -1,5 +1,8 @@
 import streamlit as st
-import sqlite3, json, io, os, datetime, uuid
+import sqlite3, json, io, os, datetime, uuid, zipfile
+import hashlib
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from pathlib import Path
 from PIL import Image as PILImage, ImageOps
 import pandas as pd
@@ -23,37 +26,131 @@ if not FONT.exists():
     st.error('ไม่พบไฟล์ NotoSansThai-Regular.ttf ในโฟลเดอร์เดียวกับ app.py'); st.stop()
 pdfmetrics.registerFont(TTFont('Thai',str(FONT)))
 
+def database_url():
+    try:
+        return st.secrets.get('DATABASE_URL', os.environ.get('DATABASE_URL', ''))
+    except Exception:
+        return os.environ.get('DATABASE_URL', '')
+
+if not database_url():
+    st.error('กรุณาตั้งค่า DATABASE_URL ใน Streamlit Cloud → App settings → Secrets ก่อนใช้งาน')
+    st.stop()
+
 @st.cache_resource
+
 def database():
-    c=sqlite3.connect(DB,check_same_thread=False,timeout=30)
-    c.execute('PRAGMA journal_mode=WAL')
-    c.execute('CREATE TABLE IF NOT EXISTS inspections (id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT, owner TEXT, house_no TEXT, project TEXT, survey_date TEXT, items TEXT, rep_name TEXT, owner_sign_name TEXT, rep_sign TEXT, owner_sign TEXT)')
-    c.commit()
-    return c
-conn=database()
+    connection = psycopg2.connect(database_url(), connect_timeout=15, sslmode='require')
+    connection.autocommit = True
+    return connection
+
+def db_run(sql, params=(), one=False, many=False):
+    global conn
+    for attempt in range(2):
+        try:
+            if conn.closed:
+                conn = psycopg2.connect(database_url(), sslmode='require')
+                conn.autocommit = True
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, params)
+                if one:
+                    return dict(cur.fetchone()) if cur.rowcount else None
+                if many:
+                    return [dict(row) for row in cur.fetchall()]
+                return None
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            if attempt:
+                raise
+            try:
+                database.clear()
+            except Exception:
+                pass
+            conn = database()
+
+try:
+    conn = database()
+    db_run('''CREATE TABLE IF NOT EXISTS inspections (
+        id TEXT PRIMARY KEY, created_at TEXT, updated_at TEXT, owner TEXT,
+        house_no TEXT, project TEXT, survey_date TEXT, items TEXT,
+        rep_name TEXT, owner_sign_name TEXT, rep_sign TEXT, owner_sign TEXT)''')
+    db_run('''CREATE TABLE IF NOT EXISTS media (
+        id TEXT PRIMARY KEY, content BYTEA NOT NULL, content_type TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW())''')
+    db_run('''CREATE TABLE IF NOT EXISTS audit_log (
+        id BIGSERIAL PRIMARY KEY, record_id TEXT NOT NULL, changed_at TIMESTAMPTZ DEFAULT NOW(),
+        event TEXT NOT NULL, previous_data TEXT, new_data TEXT)''')
+except Exception as exc:
+    st.error('เชื่อมต่อ Neon ไม่สำเร็จ กรุณาตรวจสอบ DATABASE_URL ใน Secrets')
+    st.code(str(exc).split('password=')[0][:350])
+    st.stop()
 
 def all_records():
-    conn.row_factory=sqlite3.Row
-    return [dict(r) for r in conn.execute('SELECT * FROM inspections ORDER BY created_at ASC').fetchall()]
+    return db_run('SELECT * FROM inspections ORDER BY created_at ASC', many=True)
+
 def fetch(record_id):
-    return next((r for r in all_records() if r['id']==record_id),None)
+    return db_run('SELECT * FROM inspections WHERE id=%s', (record_id,), one=True)
+
+def media_bytes(path):
+    if not path:
+        return None
+    if path.startswith('asset:'):
+        row = db_run('SELECT content FROM media WHERE id=%s', (path[6:],), one=True)
+        return bytes(row['content']) if row else None
+    if Path(path).is_file():
+        return Path(path).read_bytes()
+    return None
+
+def put_media(data, content_type):
+    media_id = uuid.uuid4().hex
+    db_run('INSERT INTO media (id, content, content_type) VALUES (%s,%s,%s)',
+           (media_id, psycopg2.Binary(data), content_type))
+    return 'asset:' + media_id
+
 def save_file(file, prefix):
-    if file is None:return ''
-    if isinstance(file,str):return file
-    data=file.getvalue()
-    if len(data)>12*1024*1024:raise ValueError('รูปภาพต้องไม่เกิน 12 MB')
-    im=PILImage.open(io.BytesIO(data));im=ImageOps.exif_transpose(im).convert('RGB')
-    im.thumbnail((1600,1600))
-    path=UPLOADS/f'{prefix}_{uuid.uuid4().hex}.jpg'; im.save(path,quality=82,optimize=True)
-    return str(path)
+    if file is None:
+        return ''
+    if isinstance(file, str):
+        return file
+    data = file.getvalue()
+    if len(data) > 12 * 1024 * 1024:
+        raise ValueError('รูปภาพต้องไม่เกิน 12 MB')
+    im = ImageOps.exif_transpose(PILImage.open(io.BytesIO(data))).convert('RGB')
+    im.thumbnail((1600, 1600))
+    out = io.BytesIO()
+    im.save(out, format='JPEG', quality=82, optimize=True)
+    return put_media(out.getvalue(), 'image/jpeg')
+
 def save_sign(canvas, prefix, existing=''):
-    if canvas is None or canvas.image_data is None:return existing
-    import numpy as np
-    arr=canvas.image_data.astype('uint8')
-    if arr[:,:,:3].min()>=245:return existing
-    im=PILImage.fromarray(arr,'RGBA').convert('RGB')
-    path=UPLOADS/f'{prefix}_{uuid.uuid4().hex}.png';im.save(path)
-    return str(path)
+    if canvas is None or canvas.image_data is None:
+        return existing
+    arr = canvas.image_data.astype('uint8')
+    if arr[:, :, :3].min() >= 245:
+        return existing
+    im = PILImage.fromarray(arr, 'RGBA').convert('RGB')
+    out = io.BytesIO()
+    im.save(out, format='PNG')
+    return put_media(out.getvalue(), 'image/png')
+
+def save_record(r):
+    old = fetch(r['id'])
+    now = datetime.datetime.now().isoformat(timespec='seconds')
+    columns = ('id','created_at','updated_at','owner','house_no','project','survey_date',
+               'items','rep_name','owner_sign_name','rep_sign','owner_sign')
+    values = (r['id'], old['created_at'] if old else now, now, r['owner'], r['house_no'],
+              r['project'], r['survey_date'], json.dumps(r['items'], ensure_ascii=False),
+              r['rep_name'], r['owner_sign_name'], r['rep_sign'], r['owner_sign'])
+    db_run('''INSERT INTO inspections (id,created_at,updated_at,owner,house_no,project,
+             survey_date,items,rep_name,owner_sign_name,rep_sign,owner_sign)
+             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+             ON CONFLICT (id) DO UPDATE SET
+             updated_at=EXCLUDED.updated_at,owner=EXCLUDED.owner,house_no=EXCLUDED.house_no,
+             project=EXCLUDED.project,survey_date=EXCLUDED.survey_date,items=EXCLUDED.items,
+             rep_name=EXCLUDED.rep_name,owner_sign_name=EXCLUDED.owner_sign_name,
+             rep_sign=EXCLUDED.rep_sign,owner_sign=EXCLUDED.owner_sign''', values)
+    db_run('INSERT INTO audit_log (record_id,event,previous_data,new_data) VALUES (%s,%s,%s,%s)',
+           (r['id'], 'แก้ไข' if old else 'สร้างใหม่',
+            json.dumps(old,ensure_ascii=False) if old else None,
+            json.dumps(dict(zip(columns,values)),ensure_ascii=False)))
+
 def fresh():
     return {'id':uuid.uuid4().hex,'owner':'','house_no':'','project':'','survey_date':str(datetime.date.today()),'items':[{'before':'','damage':'','after':'','repair':'','status':'รอดำเนินการ'}], 'rep_name':'','owner_sign_name':'','rep_sign':'','owner_sign':''}
 def load_form(r):
@@ -69,22 +166,47 @@ def make_pdf(r):
     title=ParagraphStyle('title',parent=normal,fontSize=16,leading=22,alignment=1)
     def p(s,style=normal):return Paragraph(escape(str(s or '-')).replace('\n','<br/>'),style)
     def pic(path):
-        if path and Path(path).is_file():
+        if path and media_bytes(path):
             try:
-                im=PILImage.open(path);w,h=im.size
+                raw=media_bytes(path);im=PILImage.open(io.BytesIO(raw));w,h=im.size
                 ratio=min(5*cm/w,6*cm/h)
-                return Image(path,width=w*ratio,height=h*ratio)
+                return Image(io.BytesIO(raw),width=w*ratio,height=h*ratio)
             except Exception:pass
         return p('ยังไม่มีรูปภาพ',small)
-    story=[p('รายการความเสียหายบ้านข้างเคียง',title),Spacer(1,.3*cm),p('1. รายละเอียดบ้าน'),p(f"ชื่อเจ้าของบ้าน: {r['owner']}     บ้านเลขที่: {r['house_no']}"),p(f"ชื่อโครงการ: {r['project']}     วันที่สำรวจ: {r['survey_date']}"),Spacer(1,.4*cm),p('2. รายละเอียดความเสียหาย'),Spacer(1,.2*cm)]
+    # แสดงข้อมูลแต่ละช่องแยกกัน เพื่อป้องกันข้อความยาวเบียดวันที่/บ้านเลขที่
+    raw_date = str(r.get('survey_date') or '').strip()
+    try:
+        survey_display = datetime.date.fromisoformat(raw_date[:10]).strftime('%d/%m/%Y')
+    except (ValueError, TypeError):
+        survey_display = 'ไม่ระบุ'
+    detail_rows = [
+        [p('ชื่อเจ้าของบ้าน',small), p(r.get('owner') or 'ไม่ระบุ'),
+         p('บ้านเลขที่',small), p(r.get('house_no') or 'ไม่ระบุ')],
+        [p('ชื่อโครงการ',small), p(r.get('project') or 'ไม่ระบุ'),
+         p('วันที่สำรวจ',small), p(survey_display)],
+    ]
+    detail_table = Table(detail_rows, colWidths=[2.6*cm, 10.3*cm, 2.4*cm, 12.0*cm], hAlign='LEFT')
+    detail_table.setStyle(TableStyle([
+        ('GRID',(0,0),(-1,-1),0.4,colors.HexColor('#cbd5e1')),
+        ('BACKGROUND',(0,0),(0,-1),colors.HexColor('#e2e8f0')),
+        ('BACKGROUND',(2,0),(2,-1),colors.HexColor('#e2e8f0')),
+        ('VALIGN',(0,0),(-1,-1),'TOP'),
+        ('LEFTPADDING',(0,0),(-1,-1),7),
+        ('RIGHTPADDING',(0,0),(-1,-1),7),
+        ('TOPPADDING',(0,0),(-1,-1),7),
+        ('BOTTOMPADDING',(0,0),(-1,-1),7),
+    ]))
+    story=[p('รายการความเสียหายบ้านข้างเคียง',title),Spacer(1,.3*cm),
+           p('1. รายละเอียดบ้าน'),Spacer(1,.15*cm),detail_table,
+           Spacer(1,.4*cm),p('2. รายละเอียดความเสียหาย'),Spacer(1,.2*cm)]
     header=[p(x,small) for x in ['ที่','รูปภาพก่อนแก้ไข','รายละเอียดก่อนแก้ไข','รูปภาพหลังแก้ไข','รายละเอียดการแก้ไข','สถานะ']]
     for index,item in enumerate(json.loads(r['items']),1):
-        cells=[p(index,small),pic(item.get('before')),p(item.get('damage'),small),pic(item.get('after')),p(item.get('repair'),small),p(item.get('status'),small)]
+        cells=[p(index,small),pic(item.get('before')),p(item.get('damage'),small),pic(item.get('after')),p((item.get('repair') or '')+'\nผู้รับผิดชอบ: '+(item.get('assignee') or '-')+'\nกำหนด: '+(item.get('due_date') or '-'),small),p(item.get('status'),small)]
         table=Table([header,cells],colWidths=[1*cm,5.2*cm,6.5*cm,5.2*cm,6.5*cm,3.1*cm],repeatRows=1,hAlign='CENTER')
         table.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.5,colors.HexColor('#cbd5e1')),('BACKGROUND',(0,0),(-1,0),colors.HexColor('#e2e8f0')),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('ALIGN',(0,0),(0,-1),'CENTER'),('LEFTPADDING',(0,0),(-1,-1),6),('RIGHTPADDING',(0,0),(-1,-1),6),('TOPPADDING',(0,0),(-1,-1),7),('BOTTOMPADDING',(0,0),(-1,-1),7)]))
         story.extend([table,Spacer(1,.25*cm)])
     def signature(path,name,role):
-        image=Image(path,width=5*cm,height=1.6*cm) if path and Path(path).is_file() else p('................................................')
+        image=Image(io.BytesIO(media_bytes(path)),width=5*cm,height=1.6*cm) if path and media_bytes(path) else p('................................................')
         cell=Table([[image],[p(name or '................................',small)],[p(role,small)]],colWidths=[8*cm])
         cell.setStyle(TableStyle([('ALIGN',(0,0),(-1,-1),'CENTER'),('VALIGN',(0,0),(-1,-1),'MIDDLE')]))
         return cell
@@ -140,19 +262,29 @@ if tab.startswith('📝'):
             with c1:
                 st.markdown('**ภาพก่อนแก้ไข**')
                 before=st.file_uploader('แนบภาพความเสียหาย',type=['png','jpg','jpeg','webp'],key=f'before_{v}_{i}')
-                if before is not None:item['before']=save_file(before,f'before_{r["id"]}_{i}')
-                if item.get('before') and Path(item['before']).is_file():st.image(item['before'],width=240)
+                if before is not None:
+                    digest=hashlib.sha256(before.getvalue()).hexdigest()
+                    if item.get('_before_digest')!=digest:
+                        item['before']=save_file(before,f'before_{r["id"]}_{i}')
+                        item['_before_digest']=digest
+                if item.get('before') and media_bytes(item['before']):st.image(media_bytes(item['before']),width=240)
             with c2:
                 st.markdown('**ภาพหลังแก้ไข**')
                 after=st.file_uploader('แนบภาพหลังแก้ไข (เพิ่มภายหลังได้)',type=['png','jpg','jpeg','webp'],key=f'after_{v}_{i}')
-                if after is not None:item['after']=save_file(after,f'after_{r["id"]}_{i}')
-                if item.get('after') and Path(item['after']).is_file():st.image(item['after'],width=240)
+                if after is not None:
+                    digest=hashlib.sha256(after.getvalue()).hexdigest()
+                    if item.get('_after_digest')!=digest:
+                        item['after']=save_file(after,f'after_{r["id"]}_{i}')
+                        item['_after_digest']=digest
+                if item.get('after') and media_bytes(item['after']):st.image(media_bytes(item['after']),width=240)
             d1,d2=st.columns(2)
             with d1:
                 item['damage']=st.text_area('รายละเอียดความเสียหาย (ก่อนแก้ไข)',value=item.get('damage',''),height=120,key=f'damage_{v}_{i}',placeholder='ระบุความเสียหายที่พบ...')
             with d2:
                 item['repair']=st.text_area('รายละเอียดการแก้ไข (หลังแก้ไข)',value=item.get('repair',''),height=120,key=f'repair_{v}_{i}',placeholder='ระบุวิธีการแก้ไข หรือผลการซ่อม...')
-            item['status']=st.selectbox('สถานะการแก้ไข',statuses,index=statuses.index(item.get('status','รอดำเนินการ')),key=f'status_{v}_{i}')
+            item['status']=st.selectbox('สถานะการแก้ไข',statuses,index=statuses.index(item.get('status','รอดำเนินการ')) if item.get('status','รอดำเนินการ') in statuses else 0,key=f'status_{v}_{i}')
+            item['assignee']=st.text_input('ผู้รับผิดชอบการแก้ไข',value=item.get('assignee',''),key=f'assignee_{v}_{i}')
+            item['due_date']=st.text_input('กำหนดแก้ไข (YYYY-MM-DD)',value=item.get('due_date',''),key=f'due_{v}_{i}',placeholder='2026-11-30')
             if st.button('🗑️ ลบรายการนี้',key=f'del_{v}_{i}',disabled=len(r['items'])==1):
                 r['items'].pop(i);st.session_state.form_version+=1;st.rerun()
     st.caption(f"เพิ่มแล้ว {len(r['items'])} จาก 100 รายการ")
@@ -179,8 +311,7 @@ if tab.startswith('📝'):
             r['rep_sign']=save_sign(rep_canvas,f'rep_{r["id"]}',r.get('rep_sign',''))
             r['owner_sign']=save_sign(own_canvas,f'owner_{r["id"]}',r.get('owner_sign',''))
             old=fetch(r['id']);now=datetime.datetime.now().isoformat(timespec='seconds')
-            conn.execute('INSERT OR REPLACE INTO inspections VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',(r['id'],old['created_at'] if old else now,now,r['owner'],r['house_no'],r['project'],r['survey_date'],json.dumps(r['items'],ensure_ascii=False),r['rep_name'],r['owner_sign_name'],r['rep_sign'],r['owner_sign']))
-            conn.commit();st.session_state.last_saved=r['id'];load_form(None);st.success('บันทึกสำเร็จ เปิดดู PDF ได้ในหน้าประวัติ และเริ่มกรอกชุดใหม่ได้ทันที')
+            save_record(r);st.session_state.last_saved=r['id'];load_form(None);st.success('บันทึกสำเร็จ เปิดดู PDF ได้ในหน้าประวัติ และเริ่มกรอกชุดใหม่ได้ทันที')
     if st.session_state.get('last_saved'):
         last=fetch(st.session_state.last_saved)
         if last:st.download_button('📄 ดาวน์โหลด PDF ของรายการที่บันทึกล่าสุด',make_pdf(last),file_name=f'inspection_{last["house_no"]}.pdf',mime='application/pdf')
@@ -209,6 +340,9 @@ elif tab.startswith('📂'):
                     key='pdf_'+str(r['id'])
                 )
     st.info('กดเปิดแก้ไขเพื่อกลับไปยังแบบฟอร์มพร้อมข้อมูลเดิม จากนั้นแก้ไขและกดบันทึกข้อมูล')
+    with st.expander('🕘 ประวัติการแก้ไข'):
+        logs=db_run('SELECT record_id,changed_at,event FROM audit_log ORDER BY changed_at DESC LIMIT 200',many=True)
+        st.dataframe(pd.DataFrame(logs),hide_index=True,use_container_width=True) if logs else st.info('ยังไม่มีประวัติ')
 else:
     st.subheader('แดชบอร์ดภาพรวม')
     all_items=[i for r in records for i in json.loads(r['items'])]
@@ -218,6 +352,14 @@ else:
     st.progress(done/total if total else 0)
     counts=pd.DataFrame({'สถานะ':statuses,'จำนวน':[sum(x['status']==s for x in all_items) for s in statuses]}).set_index('สถานะ')
     st.bar_chart(counts)
+    today=str(datetime.date.today())
+    overdue=[(r,i) for r in records for i in json.loads(r['items'])
+             if i.get('due_date') and i['due_date'] < today and i.get('status') not in ('แก้ไขแล้ว','ไม่ต้องแก้ไข')]
+    st.metric('รายการเกินกำหนด',len(overdue))
+    if overdue:
+        st.dataframe(pd.DataFrame([{'บ้านเลขที่':r['house_no'],'โครงการ':r['project'],
+             'รายละเอียด':i.get('damage',''),'ผู้รับผิดชอบ':i.get('assignee',''),
+             'กำหนดแก้ไข':i.get('due_date','')} for r,i in overdue]),hide_index=True,use_container_width=True)
     if records:
         st.subheader('สรุปรายโครงการ')
         data=[]
