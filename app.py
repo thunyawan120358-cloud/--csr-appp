@@ -197,7 +197,7 @@ elif tab.startswith('📂'):
                 if st.button('✏️ เปิดแก้ไข/เพิ่มภาพหลังแก้ไข', key='edit_'+str(r['id'])):
                     load_form(r)
                     st.session_state.current_menu = MENU_OPTIONS[0]
-                    st.rerun())
+                    st.rerun()
             with c2:
                 st.download_button(
                     '⬇️ ดาวน์โหลด PDF ล่าสุด',
