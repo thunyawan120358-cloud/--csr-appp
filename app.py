@@ -67,7 +67,21 @@ def make_pdf(r):
     normal=ParagraphStyle('thai',fontName='Thai',fontSize=10,leading=16,wordWrap='CJK')
     small=ParagraphStyle('small',parent=normal,fontSize=8,leading=12)
     title=ParagraphStyle('title',parent=normal,fontSize=16,leading=22,alignment=1)
-    def p(s,style=normal):return Paragraph(escape(str(s or '-')).replace('\n','<br/>'),style)
+    # ฟอนต์ภาษาไทยบางไฟล์ไม่แสดงตัวเลขอารบิกใน PDF
+    # แปลงเฉพาะตัวเลขที่พิมพ์ในรายงานเป็นเลขไทย เพื่อให้บ้านเลขที่/วันที่ไม่หาย
+    thai_digits = str.maketrans('0123456789', '๐๑๒๓๔๕๖๗๘๙')
+    def p(s, style=normal):
+        value = str(s if s is not None and str(s).strip() else '-')
+        return Paragraph(escape(value.translate(thai_digits)).replace('\n', '<br/>'), style)
+    def survey_date_text(record):
+        raw = str(record.get('survey_date') or '').strip()
+        if not raw or raw in ('--', '-'):
+            return 'ไม่ได้ระบุวันที่สำรวจ'
+        try:
+            return datetime.date.fromisoformat(raw[:10].replace('/', '-')).strftime('%d/%m/%Y')
+        except ValueError:
+            return raw
+
     def pic(path):
         if path and Path(path).is_file():
             try:
@@ -76,27 +90,24 @@ def make_pdf(r):
                 return Image(path,width=w*ratio,height=h*ratio)
             except Exception:pass
         return p('ยังไม่มีรูปภาพ',small)
-    # แยกข้อมูลบ้านเป็นแถวเพื่อไม่ให้ข้อความยาวเบียดช่องบ้านเลขที่หรือวันที่
-    def field_value(key):
-        value = str(r.get(key) or '').strip()
-        return value if value and value not in ('--', '-', 'None', 'null') else 'ไม่ระบุ'
-
-    details = Table([
-        [p('ชื่อเจ้าของบ้าน', small), p(field_value('owner'))],
-        [p('บ้านเลขที่ / ที่อยู่', small), p(field_value('house_no'))],
-        [p('ชื่อโครงการ', small), p(field_value('project'))],
-        [p('วันที่สำรวจ', small), p(field_value('survey_date'))],
-    ], colWidths=[4.0*cm, 23.2*cm], hAlign='LEFT')
-    details.setStyle(TableStyle([
-        ('GRID', (0,0), (-1,-1), 0.4, colors.HexColor('#cbd5e1')),
-        ('BACKGROUND', (0,0), (0,-1), colors.HexColor('#f1f5f9')),
-        ('VALIGN', (0,0), (-1,-1), 'TOP'),
-        ('LEFTPADDING', (0,0), (-1,-1), 9),
-        ('RIGHTPADDING', (0,0), (-1,-1), 9),
-        ('TOPPADDING', (0,0), (-1,-1), 7),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 7),
+    home_rows = [
+        [p('ชื่อเจ้าของบ้าน', small), p(r.get('owner', ''), normal)],
+        [p('บ้านเลขที่ / ที่อยู่', small), p(r.get('house_no', ''), normal)],
+        [p('ชื่อโครงการ', small), p(r.get('project', ''), normal)],
+        [p('วันที่สำรวจ', small), p(survey_date_text(r), normal)],
+    ]
+    home_table = Table(home_rows, colWidths=[4*cm, 23.2*cm], hAlign='LEFT')
+    home_table.setStyle(TableStyle([
+        ('GRID', (0, 0), (-1, -1), .5, colors.HexColor('#cbd5e1')),
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#edf2f7')),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 9),
     ]))
-    story=[p('รายการความเสียหายบ้านข้างเคียง',title),Spacer(1,.3*cm),p('1. รายละเอียดบ้าน'),Spacer(1,.15*cm),details,Spacer(1,.4*cm),p('2. รายละเอียดความเสียหาย'),Spacer(1,.2*cm)]
+    story = [p('รายการความเสียหายบ้านข้างเคียง', title), Spacer(1, .3*cm),
+             p('1. รายละเอียดบ้าน'), Spacer(1, .15*cm), home_table,
+             Spacer(1, .4*cm), p('2. รายละเอียดความเสียหาย'), Spacer(1, .2*cm)]
     header=[p(x,small) for x in ['ที่','รูปภาพก่อนแก้ไข','รายละเอียดก่อนแก้ไข','รูปภาพหลังแก้ไข','รายละเอียดการแก้ไข','สถานะ']]
     for index,item in enumerate(json.loads(r['items']),1):
         cells=[p(index,small),pic(item.get('before')),p(item.get('damage'),small),pic(item.get('after')),p(item.get('repair'),small),p(item.get('status'),small)]
@@ -150,11 +161,7 @@ if tab.startswith('📝'):
         r['house_no']=st.text_input('บ้านเลขที่ *',value=r['house_no'],key=f'house_{v}')
     with b:
         r['project']=st.text_input('ชื่อโครงการ *',value=r['project'],key=f'project_{v}')
-        try:
-            survey_date_value=datetime.date.fromisoformat(str(r.get('survey_date') or ''))
-        except (ValueError, TypeError):
-            survey_date_value=datetime.date.today()
-        r['survey_date']=str(st.date_input('วันที่สำรวจ',value=survey_date_value,key=f'date_{v}'))
+        r['survey_date']=str(st.date_input('วันที่สำรวจ',value=datetime.date.fromisoformat(str(r.get('survey_date') or datetime.date.today())[:10].replace('/', '-')),key=f'date_{v}'))
     st.subheader('2. รายการความเสียหาย')
     st.caption(f"จำนวน {len(r['items'])}/100 รายการ — สามารถเพิ่มภาพหลังแก้ไขในภายหลัง")
     for i,item in enumerate(r['items']):
