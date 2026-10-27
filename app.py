@@ -1,5 +1,3 @@
-app.py
-
 import streamlit as st
 import sqlite3, json, io, os, datetime, uuid
 from pathlib import Path
